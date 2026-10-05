@@ -236,37 +236,38 @@ def load_data(delay_threshold=DELAY_THRESHOLD_DAYS):
             elapsed[unresolved_mask & elapsed.notna()] > delay_threshold
         ).astype(int)
 
-    # Submission date features
+    # Submission date features (clean — no leakage)
     if "Submission_Date" in df.columns:
-        df["Sub_Month"] = df["Submission_Date"].dt.month.fillna(0).astype(int)
+        df["Sub_Month"]   = df["Submission_Date"].dt.month.fillna(0).astype(int)
         df["Sub_Weekday"] = df["Submission_Date"].dt.dayofweek.fillna(0).astype(int)
-        df["Submission_Month"] = df["Sub_Month"]   # backward compat
+        df["Sub_Quarter"] = df["Submission_Date"].dt.quarter.fillna(0).astype(int)
+        df["Submission_Month"]   = df["Sub_Month"]
         df["Submission_Weekday"] = df["Sub_Weekday"]
-        df["Submission_Year"] = df["Submission_Date"].dt.year
-        df["Submission_YM"] = df["Submission_Date"].dt.to_period("M").astype(str)
+        df["Submission_Year"]    = df["Submission_Date"].dt.year
+        df["Submission_YM"]      = df["Submission_Date"].dt.to_period("M").astype(str)
 
-    # Engineered features — financial ratios (Model A) + submission-time feats (Model B)
+    # Numeric claim features (clean)
     if "Claim_Amount" in df.columns:
-        for col in ["Approved_Amount", "Rejected_Amount", "Pending_Amount"]:
-            if col not in df.columns:
-                df[col] = 0.0
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
         df["Claim_Amount"] = pd.to_numeric(df["Claim_Amount"], errors="coerce").fillna(0)
-        claim_safe = df["Claim_Amount"].replace(0, np.nan)
-        df["Approved_Ratio"] = (df["Approved_Amount"] / claim_safe).fillna(0)
-        df["Rejected_Ratio"] = (df["Rejected_Amount"] / claim_safe).fillna(0)
-        df["Pending_Ratio"] = (df["Pending_Amount"] / claim_safe).fillna(0)
-        df["Claim_Log"] = np.log1p(df["Claim_Amount"].fillna(0))
-        threshold_75 = df["Claim_Amount"].quantile(0.75)
-        df["Claim_High_Value"] = (df["Claim_Amount"] > threshold_75).astype(int)
-        # legacy names
-        df["Claim_Amount_Log"] = df["Claim_Log"]
+        df["Claim_Log"]    = np.log1p(df["Claim_Amount"])
+
+    # Interaction features (clean — submission-time categoricals only)
     if "TPA_or_Payer" in df.columns and "Service_Type" in df.columns:
-        df["TPA_Service"] = (
-            df["TPA_or_Payer"].fillna("Unknown").astype(str)
-            + "_"
-            + df["Service_Type"].fillna("Unknown").astype(str)
-        )
+        df["TPA_Service"] = df["TPA_or_Payer"].fillna("U") + "_" + df["Service_Type"].fillna("U")
+    if "Department" in df.columns and "TPA_or_Payer" in df.columns:
+        df["Dept_TPA"] = df["Department"].fillna("U") + "_" + df["TPA_or_Payer"].fillna("U")
+    if "Department" in df.columns and "Service_Type" in df.columns:
+        df["Dept_Svc"] = df["Department"].fillna("U") + "_" + df["Service_Type"].fillna("U")
+
+    # Group-mean Claim_Amount per category (clean — encodes claim size, not outcome)
+    for col in ["TPA_or_Payer", "Department", "Service_Type", "Patient_Type"]:
+        if col in df.columns:
+            df[col+"_cmean"] = df.groupby(col)["Claim_Amount"].transform("mean")
+
+    # Financial amounts — coerce for dashboard KPIs only (NOT used as model features)
+    for col in ["Approved_Amount", "Rejected_Amount", "Pending_Amount"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
     fin_cols = ["Claim_Amount", "Approved_Amount", "Rejected_Amount", "Pending_Amount"]
     if all(c in df.columns for c in fin_cols):
@@ -328,18 +329,20 @@ def _build_final_map(raw_columns):
 @st.cache_resource(show_spinner=False)
 def load_model():
     if not os.path.isfile(MODEL_PATH):
-        return None, None, None, None, "Model file not found at models/model.pkl. Run train_model.py first."
+        return None, None, None, None, None, None, "Model file not found at models/model.pkl. Run train_model.py first."
     try:
         payload = joblib.load(MODEL_PATH)
         pipeline_a = payload.get("pipeline_a") or payload.get("pipeline")
         metadata_a = payload.get("metadata_a") or payload.get("metadata")
         pipeline_b = payload.get("pipeline_b")
         metadata_b = payload.get("metadata_b")
+        pipeline_c = payload.get("pipeline_c")
+        metadata_c = payload.get("metadata_c")
         if pipeline_a is None:
-            return None, None, None, None, "Saved file does not contain a valid pipeline."
-        return pipeline_a, metadata_a, pipeline_b, metadata_b, None
+            return None, None, None, None, None, None, "Saved file does not contain a valid pipeline."
+        return pipeline_a, metadata_a, pipeline_b, metadata_b, pipeline_c, metadata_c, None
     except Exception as e:
-        return None, None, None, None, f"Failed to load model: {str(e)}"
+        return None, None, None, None, None, None, f"Failed to load model: {str(e)}"
 
 
 # ---------------------------------------------------------------------------
@@ -448,41 +451,36 @@ def filter_dataframe(df, filters, delayed_filter, threshold):
 # Prediction helpers
 # ---------------------------------------------------------------------------
 
-def add_predictions(df, pipeline_a, metadata_a, pipeline_b, metadata_b):
-    """Add Model A (status) and Model B (delay) predictions to df."""
-    # Model A: Case_Status prediction
+def add_predictions(df, pipeline_a, metadata_a, pipeline_c, metadata_c):
+    """
+    Add predictions to df:
+      Model A  Approved vs Not-Approved (binary, clean features)
+      Model C  Delayed flag (binary, resolved claims, clean features)
+    """
+    def risk_cat(p):
+        return "High" if p >= 0.70 else ("Medium" if p >= 0.40 else "Low")
+
+    # Model A: Approved vs Not
     if pipeline_a is not None and metadata_a is not None:
-        feats_a = metadata_a.get("all_features", [])
-        if all(f in df.columns for f in feats_a):
+        feats = metadata_a.get("all_features", [])
+        if all(f in df.columns for f in feats):
             try:
-                df["Predicted_Status"] = pipeline_a.predict(df[feats_a])
-                proba_a = pipeline_a.predict_proba(df[feats_a])
-                classes_a = pipeline_a.classes_
-                df["Predicted_Status_Confidence"] = proba_a.max(axis=1)
-                # Approval probability
-                if "Approved" in classes_a:
-                    idx = list(classes_a).index("Approved")
-                    df["Predicted_Approval_Prob"] = proba_a[:, idx]
+                proba = pipeline_a.predict_proba(df[feats])
+                df["Predicted_Approved_Prob"] = proba[:, 1]
+                df["Predicted_Approved"]      = pipeline_a.predict(df[feats])
+                df["Predicted_Approval_Risk"]  = df["Predicted_Approved_Prob"].apply(risk_cat)
             except Exception:
                 pass
 
-    # Model B: Delayed prediction (submission-time features only)
-    if pipeline_b is not None and metadata_b is not None:
-        feats_b = metadata_b.get("all_features", [])
-        if all(f in df.columns for f in feats_b):
+    # Model C: Delayed flag
+    if pipeline_c is not None and metadata_c is not None:
+        feats = metadata_c.get("all_features", [])
+        if all(f in df.columns for f in feats):
             try:
-                df["Predicted_Delayed_Prob"] = pipeline_b.predict_proba(df[feats_b])[:, 1]
-                df["Predicted_Delayed"] = pipeline_b.predict(df[feats_b])
-
-                def risk_category(p):
-                    if p >= 0.70:
-                        return "High"
-                    elif p >= 0.40:
-                        return "Medium"
-                    else:
-                        return "Low"
-
-                df["Predicted_Risk"] = df["Predicted_Delayed_Prob"].apply(risk_category)
+                proba = pipeline_c.predict_proba(df[feats])
+                df["Predicted_Delayed_Prob"] = proba[:, 1]
+                df["Predicted_Delayed"]      = pipeline_c.predict(df[feats])
+                df["Predicted_Risk"]          = df["Predicted_Delayed_Prob"].apply(risk_cat)
             except Exception:
                 pass
 
@@ -1061,308 +1059,560 @@ def section_query_rejection(df):
                        title="Delayed Rate by Query / Rejection Reason", ylabel="%")
 
 
-def section_predictive_analytics(df, pipeline_a, metadata_a, pipeline_b=None, metadata_b=None):
+def section_predictive_analytics(df, pipeline_a, metadata_a, pipeline_b=None, metadata_b=None, pipeline_c=None, metadata_c=None):
     st.header("Predictive Analytics")
 
     if pipeline_a is None or metadata_a is None:
         st.error("No trained model found. Run `python train_model.py` first.")
         return
 
-    # ---- MODEL A ----
-    st.subheader("Model A — Case Status Classifier (Primary, High Accuracy)")
-    ma = metadata_a
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Model", ma.get("model_name", "N/A"))
-    c2.metric("Task", "Multi-class Classification")
-    c3.metric("Target", "Case_Status")
-    c4.metric("Accuracy", f"{ma.get('metrics', {}).get('accuracy', 0)*100:.1f}%")
-
     st.info(
-        "Predicts the claim disposition: Approved / Rejected / Partially Approved / Pending. "
-        "Features include financial ratios (Approved_Ratio, Rejected_Ratio, Pending_Ratio) "
-        "plus TPA, Department, Service Type, and Claim Amount."
+        "Three leakage-free models are trained exclusively on features available "
+        "at or before submission time. No post-outcome amounts "
+        "(Approved_Amount, Rejected_Amount, Pending_Amount) are used as inputs."
     )
 
-    best_metrics_a = ma.get("metrics", {})
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Accuracy", f"{best_metrics_a.get('accuracy', 0):.4f}")
-    m2.metric("Precision (wtd)", f"{best_metrics_a.get('precision', 0):.4f}")
-    m3.metric("Recall (wtd)", f"{best_metrics_a.get('recall', 0):.4f}")
-    m4.metric("F1 (wtd)", f"{best_metrics_a.get('f1', 0):.4f}")
-
-    cv_a = best_metrics_a.get("cv_accuracy_mean")
-    if cv_a:
-        st.metric("CV Accuracy (5-fold)", f"{cv_a:.4f} +/- {best_metrics_a.get('cv_accuracy_std', 0):.4f}")
-
-    st.subheader("Model A — Candidate Comparison")
-    all_results_a = ma.get("all_results", {})
-    if all_results_a:
-        rows = []
-        for name, metrics in all_results_a.items():
-            rows.append({
-                "Model": name,
-                "Accuracy": metrics.get("accuracy"),
-                "Precision": metrics.get("precision"),
-                "Recall": metrics.get("recall"),
-                "F1": metrics.get("f1"),
-                "CV Accuracy": metrics.get("cv_accuracy_mean"),
-                "Selected": "YES" if name == ma.get("model_name") else "",
-            })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True)
-    st.caption(f"Selection rule: {ma.get('selection_rule', '')}")
-
-    # Confusion matrix Model A
-    cm_a = best_metrics_a.get("confusion_matrix")
-    if cm_a and ma.get("target_classes"):
-        classes = ma["target_classes"]
-        if len(cm_a) == len(classes):
-            st.subheader("Model A — Confusion Matrix (Test Set)")
-            fig_cm = px.imshow(
-                cm_a, text_auto=True,
-                x=classes, y=classes,
-                labels=dict(x="Predicted", y="Actual", color="Count"),
-                title="Case Status — Confusion Matrix",
-                color_continuous_scale="Blues",
-            )
-            st.plotly_chart(fig_cm, use_container_width=True)
-
-    # Predicted Status distribution
-    if "Predicted_Status" in df.columns:
-        st.subheader("Predicted Case Status Distribution")
-        ps = df["Predicted_Status"].value_counts().reset_index()
-        ps.columns = ["Predicted Status", "Count"]
-        safe_pie_chart(ps, names="Predicted Status", values="Count",
-                       title="Predicted Case Status Distribution")
-
-    st.divider()
-
-    # ---- MODEL B ----
-    st.subheader("Model B — Delayed Claim Classifier (Secondary, Directional)")
-    if pipeline_b is None or metadata_b is None:
-        st.info("Model B not loaded. Re-run `python train_model.py` to include the delay model.")
-    else:
-        mb = metadata_b
-        b1, b2, b3, b4 = st.columns(4)
-        b1.metric("Model", mb.get("model_name", "N/A"))
-        b2.metric("Task", "Binary Classification")
-        b3.metric("Target", f"Delayed > {mb.get('delay_threshold_days', 23)} days")
-        b4.metric("F1", f"{mb.get('metrics', {}).get('f1', 0):.4f}")
-
-        st.warning(
-            "Processing time in this dataset is statistically uniformly distributed "
-            "(Kolmogorov-Smirnov test p=0.14). No submission-time feature strongly predicts "
-            "processing time. Accuracy ceiling is ~55-65%. This model provides directional "
-            "delay risk only — not a precise prediction."
+    # ── leakage disclosure ────────────────────────────────────────────────────
+    with st.expander("Leakage Prevention — Excluded Columns", expanded=False):
+        leaky = metadata_a.get("leakage_excluded", [])
+        st.write("The following columns are **excluded** from all model features "
+                 "because they are determined by the outcome (data leakage):")
+        st.dataframe(pd.DataFrame({"Excluded Column": leaky}), use_container_width=True)
+        st.write(
+            "Approved_Amount / Rejected_Amount / Pending_Amount are set by the "
+            "adjudication result itself (e.g. Rejected → Rejected_Amount = Claim_Amount). "
+            "Using them as inputs would give the model direct access to the answer, "
+            "producing spuriously perfect accuracy that would not generalise."
         )
 
-        best_metrics_b = mb.get("metrics", {})
-        bm1, bm2, bm3, bm4 = st.columns(4)
-        bm1.metric("Accuracy", f"{best_metrics_b.get('accuracy', 0):.4f}")
-        bm2.metric("Precision", f"{best_metrics_b.get('precision', 0):.4f}")
-        bm3.metric("Recall", f"{best_metrics_b.get('recall', 0):.4f}")
-        bm4.metric("F1", f"{best_metrics_b.get('f1', 0):.4f}")
+    st.divider()
 
-        st.subheader("Model B — Candidate Comparison")
-        all_results_b = mb.get("all_results", {})
-        if all_results_b:
-            rows_b = []
-            for name, metrics in all_results_b.items():
-                rows_b.append({
-                    "Model": name,
-                    "Accuracy": metrics.get("accuracy"),
-                    "F1": metrics.get("f1"),
-                    "Recall": metrics.get("recall"),
-                    "ROC-AUC": metrics.get("roc_auc"),
-                    "CV Accuracy": metrics.get("cv_accuracy_mean"),
-                    "Selected": "YES" if name == mb.get("model_name") else "",
+    # ══════════════════════════════════════════════════════════════════════════
+    # MODEL A — Approved vs Not-Approved (binary)
+    # ══════════════════════════════════════════════════════════════════════════
+    st.subheader("Model A — Approved vs Not-Approved (Binary Classification)")
+    ma = metadata_a
+    mA1, mA2, mA3, mA4 = st.columns(4)
+    mA1.metric("Algorithm", ma.get("model_name", "N/A"))
+    mA2.metric("Task", "Binary Classification")
+    mA3.metric("Target", "Approved (1) vs Not (0)")
+    mA4.metric("Test Accuracy", f"{ma.get('metrics', {}).get('accuracy', 0):.2%}")
+
+    st.caption(ma.get("model_note", ""))
+
+    bm_a = ma.get("metrics", {})
+    a1, a2, a3, a4, a5 = st.columns(5)
+    a1.metric("Accuracy",       f"{bm_a.get('accuracy',  0):.4f}")
+    a2.metric("Precision",      f"{bm_a.get('precision', 0):.4f}")
+    a3.metric("Recall",         f"{bm_a.get('recall',    0):.4f}")
+    a4.metric("F1 Score",       f"{bm_a.get('f1',        0):.4f}")
+    a5.metric("ROC-AUC",        f"{bm_a.get('roc_auc',   0):.4f}" if bm_a.get('roc_auc') else "N/A")
+
+    cv_a = bm_a.get("cv_accuracy_mean")
+    if cv_a:
+        st.metric(
+            "5-Fold CV Accuracy",
+            f"{cv_a:.4f} ± {bm_a.get('cv_accuracy_std', 0):.4f}",
+            help="Computed on the full labelled dataset with stratified splits."
+        )
+
+    with st.expander("Model A — Candidate Comparison", expanded=True):
+        all_r_a = ma.get("all_results", {})
+        if all_r_a:
+            rows = []
+            for name, m in all_r_a.items():
+                rows.append({
+                    "Model":       name,
+                    "Accuracy":    m.get("accuracy"),
+                    "Precision":   m.get("precision"),
+                    "Recall":      m.get("recall"),
+                    "F1":          m.get("f1"),
+                    "ROC-AUC":     m.get("roc_auc"),
+                    "CV Accuracy": m.get("cv_accuracy_mean"),
+                    "CV Std":      m.get("cv_accuracy_std"),
+                    "Selected":    "★" if name == ma.get("model_name") else "",
                 })
-            st.dataframe(pd.DataFrame(rows_b), use_container_width=True)
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        st.caption(f"Selection rule: {ma.get('selection_rule', '')}")
 
-        if "Predicted_Delayed_Prob" in df.columns:
-            fig = px.histogram(
-                df, x="Predicted_Delayed_Prob", nbins=20,
-                title="Model B — Predicted Delay Probability Distribution",
-                labels={"Predicted_Delayed_Prob": "Delay Probability"},
-            )
-            st.plotly_chart(fig, use_container_width=True)
+    cm_a = bm_a.get("confusion_matrix")
+    classes_a = ma.get("target_classes", ["Not Approved", "Approved"])
+    if cm_a and len(cm_a) == len(classes_a):
+        st.subheader("Model A — Confusion Matrix (Test Set)")
+        fig_cm_a = px.imshow(
+            cm_a, text_auto=True,
+            x=classes_a, y=classes_a,
+            labels=dict(x="Predicted", y="Actual", color="Count"),
+            title="Approved vs Not — Confusion Matrix",
+            color_continuous_scale="Blues",
+        )
+        st.plotly_chart(fig_cm_a, use_container_width=True)
+
+    if "Predicted_Approved_Prob" in df.columns:
+        st.subheader("Model A — Predicted Approval Probability Distribution")
+        fig_pa = px.histogram(
+            df, x="Predicted_Approved_Prob", nbins=25,
+            title="Distribution of Predicted Approval Probability",
+            labels={"Predicted_Approved_Prob": "P(Approved)"},
+        )
+        fig_pa.update_xaxes(title_text="P(Approved)")
+        fig_pa.update_yaxes(title_text="Number of Claims")
+        st.plotly_chart(fig_pa, use_container_width=True)
+
+        risk_counts = df["Predicted_Approval_Risk"].value_counts().reset_index() if "Predicted_Approval_Risk" in df.columns else None
+        if risk_counts is not None:
+            risk_counts.columns = ["Risk Category", "Count"]
+            safe_bar_chart(risk_counts, x="Risk Category", y="Count",
+                           title="Model A — Predicted Approval Risk Distribution",
+                           ylabel="Number of Claims")
 
     st.divider()
-    st.subheader("Limitations and Ethical Notice")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # MODEL B — Case_Status multi-class
+    # ══════════════════════════════════════════════════════════════════════════
+    st.subheader("Model B — Case Status Multi-class (4 Classes)")
+    if pipeline_b is None or metadata_b is None:
+        st.info("Model B not loaded. Re-run `python train_model.py` to include the multi-class model.")
+    else:
+        mb = metadata_b
+        bB1, bB2, bB3, bB4 = st.columns(4)
+        bB1.metric("Algorithm", mb.get("model_name", "N/A"))
+        bB2.metric("Task", "Multi-class Classification")
+        bB3.metric("Target", "Case_Status (4 classes)")
+        bB4.metric("Test Accuracy", f"{mb.get('metrics', {}).get('accuracy', 0):.2%}")
+
+        st.caption(mb.get("model_note", ""))
+
+        bm_b = mb.get("metrics", {})
+        b1, b2, b3, b4 = st.columns(4)
+        b1.metric("Accuracy",       f"{bm_b.get('accuracy',  0):.4f}")
+        b2.metric("Precision (wtd)",f"{bm_b.get('precision', 0):.4f}")
+        b3.metric("Recall (wtd)",   f"{bm_b.get('recall',    0):.4f}")
+        b4.metric("F1 (wtd)",       f"{bm_b.get('f1',        0):.4f}")
+
+        cv_b = bm_b.get("cv_accuracy_mean")
+        if cv_b:
+            st.metric("5-Fold CV Accuracy",
+                      f"{cv_b:.4f} ± {bm_b.get('cv_accuracy_std', 0):.4f}")
+
+        with st.expander("Model B — Candidate Comparison", expanded=True):
+            all_r_b = mb.get("all_results", {})
+            if all_r_b:
+                rows_b = []
+                for name, m in all_r_b.items():
+                    rows_b.append({
+                        "Model":       name,
+                        "Accuracy":    m.get("accuracy"),
+                        "Precision":   m.get("precision"),
+                        "Recall":      m.get("recall"),
+                        "F1":          m.get("f1"),
+                        "CV Accuracy": m.get("cv_accuracy_mean"),
+                        "CV Std":      m.get("cv_accuracy_std"),
+                        "Selected":    "★" if name == mb.get("model_name") else "",
+                    })
+                st.dataframe(pd.DataFrame(rows_b), use_container_width=True)
+            st.caption(f"Selection rule: {mb.get('selection_rule', '')}")
+
+        cm_b = bm_b.get("confusion_matrix")
+        classes_b = mb.get("target_classes")
+        if cm_b and classes_b and len(cm_b) == len(classes_b):
+            st.subheader("Model B — Confusion Matrix (Test Set)")
+            fig_cm_b = px.imshow(
+                cm_b, text_auto=True,
+                x=classes_b, y=classes_b,
+                labels=dict(x="Predicted", y="Actual", color="Count"),
+                title="Case Status (4-class) — Confusion Matrix",
+                color_continuous_scale="Purples",
+            )
+            st.plotly_chart(fig_cm_b, use_container_width=True)
+
+    st.divider()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # MODEL C — Delayed flag
+    # ══════════════════════════════════════════════════════════════════════════
+    st.subheader("Model C — Delayed Claim Risk (Binary, Directional)")
+    if pipeline_c is None or metadata_c is None:
+        st.info("Model C not loaded. Re-run `python train_model.py`.")
+    else:
+        mc = metadata_c
+        cC1, cC2, cC3, cC4 = st.columns(4)
+        cC1.metric("Algorithm", mc.get("model_name", "N/A"))
+        cC2.metric("Task", "Binary Classification")
+        cC3.metric("Threshold", f"> {mc.get('delay_threshold_days', 23)} days")
+        cC4.metric("Test F1", f"{mc.get('metrics', {}).get('f1', 0):.4f}")
+
+        st.warning(
+            "Processing time in this dataset is statistically near-uniform "
+            "(Kolmogorov-Smirnov test p = 0.14). No submission-time feature "
+            "strongly predicts processing duration. Honest accuracy ceiling is "
+            "~55–65%. This model provides a directional risk indicator only — "
+            "not a precise forecast."
+        )
+        st.caption(mc.get("model_note", ""))
+
+        bm_c = mc.get("metrics", {})
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Accuracy",  f"{bm_c.get('accuracy',  0):.4f}")
+        c2.metric("Precision", f"{bm_c.get('precision', 0):.4f}")
+        c3.metric("Recall",    f"{bm_c.get('recall',    0):.4f}")
+        c4.metric("F1",        f"{bm_c.get('f1',        0):.4f}")
+        c5.metric("ROC-AUC",   f"{bm_c.get('roc_auc',  0):.4f}" if bm_c.get('roc_auc') else "N/A")
+
+        cv_c = bm_c.get("cv_accuracy_mean")
+        if cv_c:
+            st.metric("5-Fold CV Accuracy",
+                      f"{cv_c:.4f} ± {bm_c.get('cv_accuracy_std', 0):.4f}")
+
+        with st.expander("Model C — Candidate Comparison", expanded=True):
+            all_r_c = mc.get("all_results", {})
+            if all_r_c:
+                rows_c = []
+                for name, m in all_r_c.items():
+                    rows_c.append({
+                        "Model":       name,
+                        "Accuracy":    m.get("accuracy"),
+                        "F1":          m.get("f1"),
+                        "Recall":      m.get("recall"),
+                        "ROC-AUC":     m.get("roc_auc"),
+                        "CV Accuracy": m.get("cv_accuracy_mean"),
+                        "CV Std":      m.get("cv_accuracy_std"),
+                        "Selected":    "★" if name == mc.get("model_name") else "",
+                    })
+                st.dataframe(pd.DataFrame(rows_c), use_container_width=True)
+            st.caption(f"Selection rule: {mc.get('selection_rule', '')}")
+
+        if "Predicted_Delayed_Prob" in df.columns:
+            st.subheader("Model C — Predicted Delay Probability Distribution")
+            fig_pc = px.histogram(
+                df, x="Predicted_Delayed_Prob", nbins=25,
+                title="Distribution of Predicted Delay Probability",
+                labels={"Predicted_Delayed_Prob": "P(Delayed)"},
+            )
+            fig_pc.update_xaxes(title_text="P(Delayed)")
+            fig_pc.update_yaxes(title_text="Number of Claims")
+            st.plotly_chart(fig_pc, use_container_width=True)
+
+        if "Predicted_Risk" in df.columns:
+            risk_c = df["Predicted_Risk"].value_counts().reset_index()
+            risk_c.columns = ["Risk Category", "Count"]
+            safe_bar_chart(risk_c, x="Risk Category", y="Count",
+                           title="Model C — Delay Risk Category Distribution",
+                           ylabel="Number of Claims")
+
+    st.divider()
+
+    # ── feature list ──────────────────────────────────────────────────────────
+    with st.expander("Features Used by All Models", expanded=False):
+        from train_model import CAT_FEATS, NUM_FEATS
+        feat_df = pd.DataFrame({
+            "Feature":  CAT_FEATS + NUM_FEATS,
+            "Type":     ["Categorical"] * len(CAT_FEATS) + ["Numeric"] * len(NUM_FEATS),
+        })
+        st.dataframe(feat_df, use_container_width=True)
+        st.write(
+            "Categorical features are one-hot encoded (handle_unknown='ignore'). "
+            "Numeric features are standard-scaled after median imputation. "
+            "All preprocessing is fitted on the training split only (Pipeline)."
+        )
+
+    # ── ethical / limitations notice ─────────────────────────────────────────
+    st.divider()
+    st.subheader("Model Limitations and Ethical Notice")
     st.warning(
-        "Both models are trained on a dataset of 500 records and are intended for "
-        "decision-support only. Predictions must be reviewed by a qualified healthcare "
-        "revenue-cycle professional. This is not a clinical decision-support system."
+        "All three models are trained on 500 records. "
+        "Performance metrics are honest (leakage-free) but the dataset is small. "
+        "Results must not be used for clinical decisions, claim adjudication, "
+        "or patient management without independent validation by a qualified "
+        "healthcare revenue-cycle professional. "
+        "This is a decision-support tool — human review is mandatory."
     )
 
 
-def section_prediction_form(pipeline_a, metadata_a, pipeline_b, metadata_b, df):
-    st.header("Predict Claim Outcome")
+def _derive_features(inputs, df):
+    """
+    Given a dict of raw user inputs, compute all derived submission-time features.
+    Returns a single-row DataFrame ready for pipeline.predict().
+    """
+    claim = float(inputs.get("Claim_Amount", 1.0))
+    inputs["Claim_Log"]   = float(np.log1p(claim))
+    inputs["Sub_Quarter"] = ((inputs.get("Sub_Month", 1) - 1) // 3) + 1
+
+    tpa  = inputs.get("TPA_or_Payer",  "Unknown")
+    svc  = inputs.get("Service_Type",  "Unknown")
+    dept = inputs.get("Department",    "Unknown")
+    inputs["TPA_Service"] = f"{tpa}_{svc}"
+    inputs["Dept_TPA"]    = f"{dept}_{tpa}"
+    inputs["Dept_Svc"]    = f"{dept}_{svc}"
+
+    # group-mean Claim_Amount from training distribution (approximate from df)
+    for col in ["TPA_or_Payer", "Department", "Service_Type", "Patient_Type"]:
+        key = col + "_cmean"
+        val = inputs.get(col, None)
+        if val and col in df.columns:
+            gm = df.groupby(col)["Claim_Amount"].mean()
+            inputs[key] = float(gm.get(val, df["Claim_Amount"].mean()))
+        else:
+            inputs[key] = float(df["Claim_Amount"].mean()) if "Claim_Amount" in df.columns else 0.0
+
+    return inputs
+
+
+def _build_form_inputs(cat_feats, num_feats, df, key_prefix):
+    """
+    Render Streamlit input widgets for the clean feature set.
+    Returns (inputs_dict, sub_date) — sub_date is the selected date widget value.
+    """
+    # Derived interaction features — user does not enter these directly
+    DERIVED_CATS = {"TPA_Service", "Dept_TPA", "Dept_Svc"}
+
+    inputs = {}
+    primary_cats = [f for f in cat_feats if f not in DERIVED_CATS]
+
+    st.subheader("Claim Details (Submission-time only)")
+    st.caption(
+        "Enter only the information known at the time of claim submission. "
+        "No post-outcome amounts are required or accepted."
+    )
+
+    col_left, col_right = st.columns(2)
+    for i, feat in enumerate(primary_cats):
+        col = col_left if i % 2 == 0 else col_right
+        if feat in df.columns:
+            options = sorted(df[feat].dropna().unique().tolist())
+            inputs[feat] = col.selectbox(
+                feat.replace("_", " "), options=options, key=f"{key_prefix}_{feat}"
+            )
+        else:
+            inputs[feat] = col.text_input(
+                feat.replace("_", " "), value="Unknown", key=f"{key_prefix}_{feat}"
+            )
+
+    inputs["Claim_Amount"] = st.number_input(
+        "Claim Amount (Rs)", min_value=0.0, value=100000.0,
+        step=1000.0, key=f"{key_prefix}_claim_amount"
+    )
+    sub_date = st.date_input(
+        "Submission Date", value=datetime.date.today(), key=f"{key_prefix}_sub_date"
+    )
+    inputs["Sub_Month"]   = sub_date.month
+    inputs["Sub_Weekday"] = sub_date.weekday()
+
+    return inputs, sub_date
+
+
+def section_prediction_form(pipeline_a, metadata_a, pipeline_b, metadata_b, pipeline_c, metadata_c, df):
+    st.header("Predict New Claim")
 
     if pipeline_a is None or metadata_a is None:
         st.error("Model not loaded. Run `python train_model.py` first.")
         return
 
-    tab1, tab2 = st.tabs(["Model A: Predict Case Status (High Accuracy)", "Model B: Predict Delay Risk"])
+    st.info(
+        "All three prediction models use only features available at or before "
+        "submission time — no post-outcome amounts are accepted as inputs."
+    )
 
-    # ---- TAB 1: Model A ----
-    with tab1:
-        st.info(
-            "Predict the financial disposition of a claim: "
-            "Approved / Rejected / Partially Approved / Pending. "
-            "Enter the claim's financial amounts and details."
+    tab_a, tab_b, tab_c = st.tabs([
+        "Model A: Approval Prediction",
+        "Model B: Case Status (4-class)",
+        "Model C: Delay Risk",
+    ])
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB A — Approved vs Not-Approved
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_a:
+        st.write(
+            "**Model A** predicts whether a claim will be Approved (1) or Not Approved (0). "
+            f"Selected algorithm: **{metadata_a.get('model_name', 'N/A')}**. "
+            f"Test accuracy: **{metadata_a.get('metrics', {}).get('accuracy', 0):.2%}**."
         )
         feats_a = metadata_a.get("all_features", [])
-        cat_a = metadata_a.get("cat_features", [])
-        num_a = metadata_a.get("num_features", [])
+        cat_a   = metadata_a.get("cat_features", [])
+        num_a   = metadata_a.get("num_features", [])
 
         with st.form("form_model_a"):
-            st.subheader("Claim Details")
-            inputs_a = {}
+            inp_a, _ = _build_form_inputs(cat_a, num_a, df, "a")
+            submitted_a = st.form_submit_button("Predict Approval")
 
-            for feat in cat_a:
-                if feat == "TPA_Service":
-                    continue  # derived automatically
-                if feat in df.columns:
-                    options = sorted(df[feat].dropna().unique().tolist())
-                    inputs_a[feat] = st.selectbox(feat.replace("_", " "), options=options, key=f"a_{feat}")
-                else:
-                    inputs_a[feat] = st.text_input(feat.replace("_", " "), key=f"a_{feat}")
-
-            if "Claim_Amount" in num_a or "Claim_Amount" in feats_a:
-                inputs_a["Claim_Amount"] = st.number_input(
-                    "Claim Amount (Rs)", min_value=0.0, value=100000.0, step=1000.0, key="a_claim"
-                )
-            if "Approved_Ratio" in num_a:
-                inputs_a["Approved_Ratio"] = st.slider(
-                    "Approved Amount Ratio (Approved / Claim)", 0.0, 1.0, 0.90, 0.01, key="a_apr"
-                )
-            if "Rejected_Ratio" in num_a:
-                inputs_a["Rejected_Ratio"] = st.slider(
-                    "Rejected Amount Ratio (Rejected / Claim)", 0.0, 1.0, 0.0, 0.01, key="a_rej"
-                )
-            if "Pending_Ratio" in num_a:
-                inputs_a["Pending_Ratio"] = st.slider(
-                    "Pending Amount Ratio (Pending / Claim)", 0.0, 1.0, 0.10, 0.01, key="a_pend"
-                )
-
-            sub_date_a = st.date_input("Submission Date", value=datetime.date.today(), key="a_date")
-            inputs_a["Sub_Month"] = sub_date_a.month
-            inputs_a["Sub_Weekday"] = sub_date_a.weekday()
-
-            sub_a = st.form_submit_button("Predict Case Status")
-
-        if sub_a:
-            # Derive computed features
-            claim = inputs_a.get("Claim_Amount", 1)
-            inputs_a["Claim_Log"] = float(np.log1p(claim))
-            threshold_75 = df["Claim_Amount"].quantile(0.75)
-            inputs_a["Claim_High_Value"] = int(claim > threshold_75)
-            tpa = inputs_a.get("TPA_or_Payer", "Unknown")
-            svc = inputs_a.get("Service_Type", "Unknown")
-            inputs_a["TPA_Service"] = f"{tpa}_{svc}"
-
+        if submitted_a:
+            inp_a = _derive_features(inp_a, df)
             try:
-                row = {f: inputs_a.get(f, 0) for f in feats_a}
-                input_df = pd.DataFrame([row])
-                pred_status = pipeline_a.predict(input_df)[0]
-                proba = pipeline_a.predict_proba(input_df)[0]
-                confidence = float(proba.max())
-                classes = list(pipeline_a.classes_)
+                row_a = {f: inp_a.get(f, 0) for f in feats_a}
+                X_a = pd.DataFrame([row_a])
+                pred_a = pipeline_a.predict(X_a)[0]
+                proba_a = pipeline_a.predict_proba(X_a)[0]
+                confidence_a = float(proba_a.max())
+                classes_a = list(pipeline_a.classes_)
+                label_a = "Approved" if pred_a == 1 else "Not Approved"
+                risk_a  = "High" if proba_a[1] >= 0.70 else ("Medium" if proba_a[1] >= 0.40 else "Low")
 
                 st.divider()
-                st.subheader("Prediction Result")
-                r1, r2 = st.columns(2)
-                r1.metric("Predicted Case Status", pred_status)
-                r2.metric("Confidence", f"{confidence:.1%}")
+                st.subheader("Model A — Prediction Result")
+                ra1, ra2, ra3 = st.columns(3)
+                ra1.metric("Predicted Outcome", label_a)
+                ra2.metric("Confidence", f"{confidence_a:.1%}")
+                ra3.metric("Approval Risk", risk_a)
 
-                prob_df = pd.DataFrame({"Status": classes, "Probability": proba})
-                fig = px.bar(prob_df, x="Status", y="Probability",
-                             title="Probability by Status",
-                             labels={"Probability": "Probability"})
-                st.plotly_chart(fig, use_container_width=True)
+                prob_df_a = pd.DataFrame({
+                    "Class":       ["Not Approved", "Approved"],
+                    "Probability": [proba_a[0], proba_a[1]],
+                })
+                fig_a = px.bar(
+                    prob_df_a, x="Class", y="Probability",
+                    title="Model A — Class Probabilities",
+                    labels={"Probability": "Probability", "Class": "Predicted Class"},
+                    color="Class",
+                    color_discrete_map={"Approved": "#22c55e", "Not Approved": "#ef4444"},
+                )
+                fig_a.update_yaxes(range=[0, 1])
+                st.plotly_chart(fig_a, use_container_width=True)
 
-                if pred_status == "Approved":
-                    st.success("Claim is predicted to be APPROVED.")
-                elif pred_status == "Rejected":
-                    st.error("Claim is predicted to be REJECTED.")
-                elif pred_status == "Partially Approved":
-                    st.warning("Claim is predicted to be PARTIALLY APPROVED.")
+                if pred_a == 1:
+                    st.success("Claim predicted to be APPROVED.")
                 else:
-                    st.info(f"Claim is predicted to be: {pred_status}")
+                    st.error("Claim predicted to be NOT APPROVED.")
 
                 st.caption("Decision-support estimate only. Human review is mandatory.")
-            except Exception as e:
-                st.error(f"Prediction failed: {str(e)}")
+            except Exception as exc:
+                st.error(f"Prediction failed: {exc}")
 
-    # ---- TAB 2: Model B ----
-    with tab2:
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB B — Case_Status multi-class
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_b:
         if pipeline_b is None or metadata_b is None:
-            st.info("Delay model not available. Re-run `python train_model.py`.")
+            st.info("Model B not available. Re-run `python train_model.py`.")
         else:
-            st.info(
-                "Predict delay risk using only submission-time information. "
-                "Note: processing time is near-random in this dataset; "
-                "this model provides a directional risk indicator only."
+            st.write(
+                "**Model B** predicts the full Case_Status outcome across 4 classes: "
+                "Approved / Rejected / Partially Approved / Pending. "
+                f"Selected algorithm: **{metadata_b.get('model_name', 'N/A')}**. "
+                f"Test accuracy: **{metadata_b.get('metrics', {}).get('accuracy', 0):.2%}** "
+                "(honest, leakage-free)."
             )
             feats_b = metadata_b.get("all_features", [])
-            cat_b = metadata_b.get("cat_features", [])
-            num_b = metadata_b.get("num_features", [])
+            cat_b   = metadata_b.get("cat_features", [])
+            num_b   = metadata_b.get("num_features", [])
 
             with st.form("form_model_b"):
-                st.subheader("Submission-time Claim Details")
-                inputs_b = {}
-                for feat in cat_b:
-                    if feat == "TPA_Service":
-                        continue
-                    if feat in df.columns:
-                        options = sorted(df[feat].dropna().unique().tolist())
-                        inputs_b[feat] = st.selectbox(feat.replace("_", " "), options=options, key=f"b_{feat}")
-                    else:
-                        inputs_b[feat] = st.text_input(feat.replace("_", " "), key=f"b_{feat}")
-                if "Claim_Amount" in num_b or "Claim_Amount" in feats_b:
-                    inputs_b["Claim_Amount"] = st.number_input(
-                        "Claim Amount (Rs)", min_value=0.0, value=100000.0, step=1000.0, key="b_claim"
-                    )
-                sub_date_b = st.date_input("Submission Date", value=datetime.date.today(), key="b_date")
-                inputs_b["Sub_Month"] = sub_date_b.month
-                inputs_b["Sub_Weekday"] = sub_date_b.weekday()
-                sub_b = st.form_submit_button("Predict Delay Risk")
+                inp_b, _ = _build_form_inputs(cat_b, num_b, df, "b")
+                submitted_b = st.form_submit_button("Predict Case Status")
 
-            if sub_b:
-                claim_b = inputs_b.get("Claim_Amount", 1)
-                inputs_b["Claim_Log"] = float(np.log1p(claim_b))
-                threshold_75_b = df["Claim_Amount"].quantile(0.75)
-                inputs_b["Claim_High_Value"] = int(claim_b > threshold_75_b)
-                tpa_b = inputs_b.get("TPA_or_Payer", "Unknown")
-                svc_b = inputs_b.get("Service_Type", "Unknown")
-                inputs_b["TPA_Service"] = f"{tpa_b}_{svc_b}"
-
+            if submitted_b:
+                inp_b = _derive_features(inp_b, df)
                 try:
-                    row_b = {f: inputs_b.get(f, 0) for f in feats_b}
-                    input_df_b = pd.DataFrame([row_b])
-                    prob_b = pipeline_b.predict_proba(input_df_b)[0][1]
-                    pred_b = pipeline_b.predict(input_df_b)[0]
-                    risk = "High" if prob_b >= 0.70 else ("Medium" if prob_b >= 0.40 else "Low")
+                    row_b = {f: inp_b.get(f, 0) for f in feats_b}
+                    X_b = pd.DataFrame([row_b])
+                    pred_b = pipeline_b.predict(X_b)[0]
+                    proba_b = pipeline_b.predict_proba(X_b)[0]
+                    confidence_b = float(proba_b.max())
+                    classes_b = list(pipeline_b.classes_)
 
                     st.divider()
-                    st.subheader("Delay Risk Result")
-                    rb1, rb2, rb3 = st.columns(3)
-                    rb1.metric("Predicted", "Delayed" if pred_b == 1 else "Not Delayed")
-                    rb2.metric("Delay Probability", f"{prob_b:.1%}")
-                    rb3.metric("Risk Category", risk)
+                    st.subheader("Model B — Prediction Result")
+                    rb1, rb2 = st.columns(2)
+                    rb1.metric("Predicted Status", str(pred_b))
+                    rb2.metric("Confidence", f"{confidence_b:.1%}")
 
-                    if risk == "High":
-                        st.error("HIGH delay risk. Prioritise this claim.")
-                    elif risk == "Medium":
-                        st.warning("MEDIUM delay risk. Monitor closely.")
+                    prob_df_b = pd.DataFrame({
+                        "Status":      classes_b,
+                        "Probability": proba_b.tolist(),
+                    }).sort_values("Probability", ascending=False)
+                    fig_b = px.bar(
+                        prob_df_b, x="Status", y="Probability",
+                        title="Model B — Class Probabilities",
+                        labels={"Probability": "Probability", "Status": "Case Status"},
+                        color="Status",
+                    )
+                    fig_b.update_yaxes(range=[0, 1])
+                    st.plotly_chart(fig_b, use_container_width=True)
+
+                    if pred_b == "Approved":
+                        st.success("Claim predicted: APPROVED.")
+                    elif pred_b == "Rejected":
+                        st.error("Claim predicted: REJECTED.")
+                    elif pred_b == "Partially Approved":
+                        st.warning("Claim predicted: PARTIALLY APPROVED.")
+                    else:
+                        st.info(f"Claim predicted: {pred_b}")
+
+                    st.caption("Decision-support estimate only. Human review is mandatory.")
+                except Exception as exc:
+                    st.error(f"Prediction failed: {exc}")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB C — Delayed flag
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_c:
+        if pipeline_c is None or metadata_c is None:
+            st.info("Model C not available. Re-run `python train_model.py`.")
+        else:
+            threshold_c = metadata_c.get("delay_threshold_days", 23)
+            st.write(
+                f"**Model C** predicts whether a claim will take more than **{threshold_c} days** "
+                "to settle (delayed = 1). Uses only submission-time features. "
+                f"Selected algorithm: **{metadata_c.get('model_name', 'N/A')}**. "
+                f"Test F1: **{metadata_c.get('metrics', {}).get('f1', 0):.4f}**."
+            )
+            st.warning(
+                "Processing time is near-uniform in this dataset. "
+                "This is a directional risk indicator — not a precise forecast."
+            )
+            feats_c = metadata_c.get("all_features", [])
+            cat_c   = metadata_c.get("cat_features", [])
+            num_c   = metadata_c.get("num_features", [])
+
+            with st.form("form_model_c"):
+                inp_c, _ = _build_form_inputs(cat_c, num_c, df, "c")
+                submitted_c = st.form_submit_button("Predict Delay Risk")
+
+            if submitted_c:
+                inp_c = _derive_features(inp_c, df)
+                try:
+                    row_c = {f: inp_c.get(f, 0) for f in feats_c}
+                    X_c = pd.DataFrame([row_c])
+                    pred_c  = pipeline_c.predict(X_c)[0]
+                    proba_c = pipeline_c.predict_proba(X_c)[0]
+                    prob_delayed = float(proba_c[1])
+                    risk_c = "High" if prob_delayed >= 0.70 else ("Medium" if prob_delayed >= 0.40 else "Low")
+
+                    st.divider()
+                    st.subheader("Model C — Delay Risk Result")
+                    rc1, rc2, rc3 = st.columns(3)
+                    rc1.metric("Prediction", "Delayed" if pred_c == 1 else "Not Delayed")
+                    rc2.metric("Delay Probability", f"{prob_delayed:.1%}")
+                    rc3.metric("Risk Category", risk_c)
+
+                    prob_df_c = pd.DataFrame({
+                        "Class":       ["Not Delayed", "Delayed"],
+                        "Probability": [proba_c[0], proba_c[1]],
+                    })
+                    fig_c = px.bar(
+                        prob_df_c, x="Class", y="Probability",
+                        title="Model C — Delay Risk Probabilities",
+                        labels={"Probability": "Probability", "Class": ""},
+                        color="Class",
+                        color_discrete_map={"Delayed": "#ef4444", "Not Delayed": "#22c55e"},
+                    )
+                    fig_c.update_yaxes(range=[0, 1])
+                    st.plotly_chart(fig_c, use_container_width=True)
+
+                    if risk_c == "High":
+                        st.error("HIGH delay risk — prioritise this claim.")
+                    elif risk_c == "Medium":
+                        st.warning("MEDIUM delay risk — monitor closely.")
                     else:
                         st.success("LOW delay risk.")
+
                     st.caption(
                         "Directional estimate only. Processing time is near-uniformly "
                         "distributed in this dataset. Human review is mandatory."
                     )
-                except Exception as e:
-                    st.error(f"Prediction failed: {str(e)}")
+                except Exception as exc:
+                    st.error(f"Prediction failed: {exc}")
 
 
 def section_data_quality(df, audit, pipeline, metadata):
@@ -1488,7 +1738,7 @@ def main():
 
     # --- Load model ---
     with st.spinner("Loading trained model..."):
-        pipeline_a, metadata_a, pipeline_b, metadata_b, model_error = load_model()
+        pipeline_a, metadata_a, pipeline_b, metadata_b, pipeline_c, metadata_c, model_error = load_model()
 
     if model_error:
         st.warning(f"Model status: {model_error}")
@@ -1500,7 +1750,7 @@ def main():
     df = filter_dataframe(df_raw, filters, delayed_filter, threshold)
 
     # --- Predictions ---
-    df = add_predictions(df, pipeline_a, metadata_a, pipeline_b, metadata_b)
+    df = add_predictions(df, pipeline_a, metadata_a, pipeline_c, metadata_c)
 
     # --- Navigation ---
     sections = [
@@ -1542,10 +1792,10 @@ def main():
         section_query_rejection(df)
 
     elif selected_section == "Predictive Analytics":
-        section_predictive_analytics(df, pipeline_a, metadata_a, pipeline_b, metadata_b)
+        section_predictive_analytics(df, pipeline_a, metadata_a, pipeline_b, metadata_b, pipeline_c, metadata_c)
 
     elif selected_section == "Predict New Claim":
-        section_prediction_form(pipeline_a, metadata_a, pipeline_b, metadata_b, df_raw)
+        section_prediction_form(pipeline_a, metadata_a, pipeline_b, metadata_b, pipeline_c, metadata_c, df_raw)
 
     elif selected_section == "Data Quality and Model Validation":
         section_data_quality(df, audit, pipeline_a, metadata_a)
