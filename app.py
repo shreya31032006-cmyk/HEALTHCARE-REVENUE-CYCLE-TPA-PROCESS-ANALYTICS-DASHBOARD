@@ -35,7 +35,7 @@ warnings.filterwarnings("ignore")
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-DELAY_THRESHOLD_DAYS = 30
+DELAY_THRESHOLD_DAYS = 23   # median split — balanced 50/50 classes
 MODEL_PATH = os.path.join("models", "model.pkl")
 
 WORKBOOK_CANDIDATES = [
@@ -223,14 +223,30 @@ def load_data(delay_threshold=DELAY_THRESHOLD_DAYS):
             df.loc[both_valid, "Settlement_Date"] - df.loc[both_valid, "Submission_Date"]
         ).dt.days
 
-    df["Delayed"] = 0
+    df["Delayed"] = np.nan
     if "Processing_Time_Days" in df.columns:
         resolved = df["Processing_Time_Days"].notna()
-        df.loc[resolved & (df["Processing_Time_Days"] > delay_threshold), "Delayed"] = 1
+        df.loc[resolved, "Delayed"] = (
+            df.loc[resolved, "Processing_Time_Days"] > delay_threshold
+        ).astype(int)
     if "Submission_Date" in df.columns:
-        unresolved_mask = df.get("Processing_Time_Days", pd.Series(dtype=float)).isna()
+        unresolved_mask = df["Processing_Time_Days"].isna()
         elapsed = (analysis_date - df["Submission_Date"]).dt.days
-        df.loc[unresolved_mask & (elapsed > delay_threshold), "Delayed"] = 1
+        df.loc[unresolved_mask & elapsed.notna(), "Delayed"] = (
+            elapsed[unresolved_mask & elapsed.notna()] > delay_threshold
+        ).astype(int)
+
+    # Engineered features (mirrors train_model.py — no leakage)
+    if "Claim_Amount" in df.columns:
+        df["Claim_Amount_Log"] = np.log1p(df["Claim_Amount"].fillna(0))
+        threshold_75 = df["Claim_Amount"].quantile(0.75)
+        df["Claim_High_Value"] = (df["Claim_Amount"] > threshold_75).astype(int)
+    if "TPA_or_Payer" in df.columns and "Service_Type" in df.columns:
+        df["TPA_Service"] = (
+            df["TPA_or_Payer"].fillna("Unknown").astype(str)
+            + "_"
+            + df["Service_Type"].fillna("Unknown").astype(str)
+        )
 
     if "Submission_Date" in df.columns:
         df["Submission_Month"] = df["Submission_Date"].dt.month.fillna(0).astype(int)
@@ -392,13 +408,17 @@ def filter_dataframe(df, filters, delayed_filter, threshold):
     # Recompute Delayed based on current threshold
     if "Processing_Time_Days" in fdf.columns:
         analysis_date = pd.Timestamp(datetime.date.today())
-        fdf["Delayed"] = 0
+        fdf["Delayed"] = np.nan
         resolved = fdf["Processing_Time_Days"].notna()
-        fdf.loc[resolved & (fdf["Processing_Time_Days"] > threshold), "Delayed"] = 1
+        fdf.loc[resolved, "Delayed"] = (
+            fdf.loc[resolved, "Processing_Time_Days"] > threshold
+        ).astype(int)
         if "Submission_Date" in fdf.columns:
             unresolved_mask = fdf["Processing_Time_Days"].isna()
             elapsed = (analysis_date - fdf["Submission_Date"]).dt.days
-            fdf.loc[unresolved_mask & (elapsed > threshold), "Delayed"] = 1
+            fdf.loc[unresolved_mask & elapsed.notna(), "Delayed"] = (
+                elapsed[unresolved_mask & elapsed.notna()] > threshold
+            ).astype(int)
 
     if delayed_filter == "Delayed Only":
         fdf = fdf[fdf["Delayed"] == 1]
