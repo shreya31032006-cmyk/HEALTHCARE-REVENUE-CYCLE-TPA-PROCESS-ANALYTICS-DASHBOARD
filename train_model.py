@@ -71,16 +71,33 @@ WORKBOOK_CANDIDATES = [
 
 EXPECTED_COLUMNS = [
     "Case_ID","Patient_Type","Department","TPA_or_Payer","Service_Type",
+    # v5 new columns (genuinely predictive, submission-time)
+    "Diagnosis_Code","Hospital_Tier","Pre_Authorization",
+    "Days_to_Submit","Policy_Coverage_Type","Document_Complete",
+    # financial / outcome columns
     "Claim_Amount","Approved_Amount","Rejected_Amount","Pending_Amount",
     "Submission_Date","Settlement_Date","Case_Status","Query_or_Rejection_Reason",
 ]
 
 # ── clean feature lists (NO post-outcome columns) ────────────────────────────
-CAT_FEATS  = ["Patient_Type","Department","TPA_or_Payer","Service_Type",
-              "TPA_Service","Dept_TPA","Dept_Svc"]
-NUM_FEATS  = ["Claim_Amount","Claim_Log","Sub_Month","Sub_Weekday","Sub_Quarter",
-              "TPA_or_Payer_cmean","Department_cmean",
-              "Service_Type_cmean","Patient_Type_cmean"]
+# v5: includes 6 new submission-time columns that carry genuine signal
+CAT_FEATS  = [
+    # original categoricals
+    "Patient_Type","Department","TPA_or_Payer","Service_Type",
+    # new v5 categoricals
+    "Diagnosis_Code","Pre_Authorization","Policy_Coverage_Type","Document_Complete",
+    # derived interactions
+    "TPA_Service","Dept_TPA","Dept_Svc",
+]
+NUM_FEATS  = [
+    # original numerics
+    "Claim_Amount","Claim_Log","Sub_Month","Sub_Weekday","Sub_Quarter",
+    # new v5 numerics
+    "Hospital_Tier","Days_to_Submit",
+    # group-mean encoding
+    "TPA_or_Payer_cmean","Department_cmean",
+    "Service_Type_cmean","Patient_Type_cmean",
+]
 
 LEAKY_COLS = ["Approved_Amount","Rejected_Amount","Pending_Amount",
               "Approved_Ratio","Rejected_Ratio","Pending_Ratio",
@@ -134,10 +151,27 @@ def load_and_prepare(path):
                (df["Settlement_Date"] < df["Submission_Date"]))
         df.loc[bad, "Settlement_Date"] = pd.NaT
 
-    # numeric coerce
+    # numeric coerce — financial columns
     for col in ["Claim_Amount","Approved_Amount","Rejected_Amount","Pending_Amount"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+    # ── v5 new column coercion and defaults ──────────────────────────────────
+    if "Hospital_Tier" in df.columns:
+        df["Hospital_Tier"] = pd.to_numeric(df["Hospital_Tier"], errors="coerce").fillna(2).astype(int)
+    else:
+        df["Hospital_Tier"] = 2   # default: Tier-2
+
+    if "Days_to_Submit" in df.columns:
+        df["Days_to_Submit"] = pd.to_numeric(df["Days_to_Submit"], errors="coerce").fillna(7).astype(int)
+    else:
+        df["Days_to_Submit"] = 7  # default: 7 days
+
+    for col in ["Pre_Authorization","Policy_Coverage_Type","Document_Complete","Diagnosis_Code"]:
+        if col not in df.columns:
+            df[col] = "Unknown"
+        else:
+            df[col] = df[col].fillna("Unknown").astype(str).str.strip()
 
     # ── clean feature engineering ────────────────────────────────────────────
     df["Sub_Month"]   = df["Submission_Date"].dt.month.fillna(0).astype(int)

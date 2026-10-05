@@ -47,12 +47,18 @@ WORKBOOK_CANDIDATES = [
 
 EXPECTED_COLUMNS = [
     "Case_ID", "Patient_Type", "Department", "TPA_or_Payer",
-    "Service_Type", "Claim_Amount", "Approved_Amount",
+    "Service_Type",
+    # v5 new submission-time columns
+    "Diagnosis_Code", "Hospital_Tier", "Pre_Authorization",
+    "Days_to_Submit", "Policy_Coverage_Type", "Document_Complete",
+    # financial / outcome
+    "Claim_Amount", "Approved_Amount",
     "Rejected_Amount", "Pending_Amount", "Submission_Date",
     "Settlement_Date", "Case_Status", "Query_or_Rejection_Reason",
 ]
 
-VALID_STATUSES = {"Approved", "Pending", "Rejected", "Queried", "In Process", "Settled"}
+VALID_STATUSES = {"Approved", "Pending", "Rejected", "Queried",
+                  "In Process", "Settled", "Partially Approved"}
 
 # ---------------------------------------------------------------------------
 # Page config (must be first Streamlit call)
@@ -245,6 +251,23 @@ def load_data(delay_threshold=DELAY_THRESHOLD_DAYS):
         df["Submission_Weekday"] = df["Sub_Weekday"]
         df["Submission_Year"]    = df["Submission_Date"].dt.year
         df["Submission_YM"]      = df["Submission_Date"].dt.to_period("M").astype(str)
+
+    # ── v5 new column coercion and defaults ──────────────────────────────────
+    if "Hospital_Tier" in df.columns:
+        df["Hospital_Tier"] = pd.to_numeric(df["Hospital_Tier"], errors="coerce").fillna(2).astype(int)
+    else:
+        df["Hospital_Tier"] = 2
+
+    if "Days_to_Submit" in df.columns:
+        df["Days_to_Submit"] = pd.to_numeric(df["Days_to_Submit"], errors="coerce").fillna(7).astype(int)
+    else:
+        df["Days_to_Submit"] = 7
+
+    for col in ["Pre_Authorization", "Policy_Coverage_Type", "Document_Complete", "Diagnosis_Code"]:
+        if col not in df.columns:
+            df[col] = "Unknown"
+        else:
+            df[col] = df[col].fillna("Unknown").astype(str).str.strip()
 
     # Numeric claim features (clean)
     if "Claim_Amount" in df.columns:
@@ -1359,16 +1382,30 @@ def _derive_features(inputs, df):
     return inputs
 
 
+# Static options for new v5 columns (presented as user-friendly labels)
+_PREAUTH_OPTIONS      = ["Yes", "No"]
+_POLICY_OPTIONS       = ["Basic", "Enhanced", "Premium"]
+_DOC_OPTIONS          = ["Yes", "No"]
+_TIER_OPTIONS         = [1, 2, 3]
+_TIER_LABELS          = {1: "Tier 1 — Large / Teaching Hospital",
+                         2: "Tier 2 — Mid-size Hospital",
+                         3: "Tier 3 — Small / Rural Clinic"}
+
+
 def _build_form_inputs(cat_feats, num_feats, df, key_prefix):
     """
     Render Streamlit input widgets for the clean feature set.
-    Returns (inputs_dict, sub_date) — sub_date is the selected date widget value.
+    Handles both original categoricals and the 6 new v5 columns.
+    Returns (inputs_dict, sub_date).
     """
     # Derived interaction features — user does not enter these directly
     DERIVED_CATS = {"TPA_Service", "Dept_TPA", "Dept_Svc"}
+    # v5 new columns handled with curated widgets below
+    V5_CATS = {"Diagnosis_Code", "Pre_Authorization", "Policy_Coverage_Type", "Document_Complete"}
+    V5_NUMS = {"Hospital_Tier", "Days_to_Submit"}
 
     inputs = {}
-    primary_cats = [f for f in cat_feats if f not in DERIVED_CATS]
+    primary_cats = [f for f in cat_feats if f not in DERIVED_CATS and f not in V5_CATS]
 
     st.subheader("Claim Details (Submission-time only)")
     st.caption(
@@ -1376,6 +1413,7 @@ def _build_form_inputs(cat_feats, num_feats, df, key_prefix):
         "No post-outcome amounts are required or accepted."
     )
 
+    # ── Original categoricals ─────────────────────────────────────────────────
     col_left, col_right = st.columns(2)
     for i, feat in enumerate(primary_cats):
         col = col_left if i % 2 == 0 else col_right
@@ -1389,6 +1427,61 @@ def _build_form_inputs(cat_feats, num_feats, df, key_prefix):
                 feat.replace("_", " "), value="Unknown", key=f"{key_prefix}_{feat}"
             )
 
+    # Diagnosis_Code is auto-derived from Department — show read-only
+    dept_val = inputs.get("Department", "")
+    _DEPT_ICD = {
+        "Cardiology": "I00-I99", "Dermatology": "L00-L99",
+        "Gastroenterology": "K00-K93", "Gynecology": "N60-N99",
+        "Nephrology": "N00-N59", "Neurology": "G00-G99",
+        "Oncology": "C00-D49", "Ophthalmology": "H00-H59",
+        "Orthopedics": "M00-M99", "Pulmonology": "J00-J99",
+    }
+    inputs["Diagnosis_Code"] = _DEPT_ICD.get(dept_val, "Z00-Z99")
+    st.info(f"Diagnosis Code (auto from Department): **{inputs['Diagnosis_Code']}**")
+
+    # ── New v5 fields ─────────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("Claim Preparation Details")
+    st.caption("These fields reflect the quality and completeness of the claim at submission.")
+
+    v5_l, v5_r = st.columns(2)
+
+    inputs["Pre_Authorization"] = v5_l.selectbox(
+        "Pre-Authorization Obtained",
+        options=_PREAUTH_OPTIONS,
+        help="Was a pre-authorization obtained from the TPA before treatment?",
+        key=f"{key_prefix}_pre_auth"
+    )
+    inputs["Document_Complete"] = v5_r.selectbox(
+        "Documents Complete",
+        options=_DOC_OPTIONS,
+        help="Are all required supporting documents attached to this claim?",
+        key=f"{key_prefix}_doc_complete"
+    )
+    inputs["Policy_Coverage_Type"] = v5_l.selectbox(
+        "Policy Coverage Type",
+        options=_POLICY_OPTIONS,
+        help="Basic = limited coverage, Enhanced = standard, Premium = comprehensive.",
+        key=f"{key_prefix}_policy"
+    )
+    tier_label = v5_r.selectbox(
+        "Hospital Tier",
+        options=[1, 2, 3],
+        format_func=lambda x: _TIER_LABELS[x],
+        help="1 = Large/teaching hospital, 2 = Mid-size, 3 = Small/rural clinic.",
+        key=f"{key_prefix}_tier"
+    )
+    inputs["Hospital_Tier"] = int(tier_label)
+
+    inputs["Days_to_Submit"] = st.slider(
+        "Days from Treatment to Claim Submission",
+        min_value=1, max_value=30, value=5,
+        help="How many days after treatment was this claim submitted?",
+        key=f"{key_prefix}_days"
+    )
+
+    # ── Financial and date ────────────────────────────────────────────────────
+    st.divider()
     inputs["Claim_Amount"] = st.number_input(
         "Claim Amount (Rs)", min_value=0.0, value=100000.0,
         step=1000.0, key=f"{key_prefix}_claim_amount"
